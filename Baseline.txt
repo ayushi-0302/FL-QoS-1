@@ -1,0 +1,8 @@
+Initial Centralized training details:
+Baseline
+
+Test loss: 0.9432
+Test accuracy: 0.6755
+
+Federated baseline accuracy:
+Round 10: Test Accuracy = 0.9654 ---
