@@ -15,6 +15,18 @@ def weights_to_json(weights: list) -> list:
 def json_to_weights(json_weights: list) -> list:
     return [np.array(w) for w in json_weights]
 
+# --- Non-IID data mapping ---
+client_class_map = {
+    "client-001": [0,1,2],       # Classes 0,1,2
+    "client-002": [3,4,5,6],     # Classes 3,4,5,6
+    "client-003": [7,8,9]        # Classes 7,8,9
+}
+client_sample_count = {
+    "client-001": 400,
+    "client-002": 600,
+    "client-003": 300
+}
+
 # --- Client logic ---
 def run_client(client_id: str):
     print(f"\n--- STARTING CLIENT {client_id} ---")
@@ -58,13 +70,21 @@ def run_client(client_id: str):
     local_model.compile(loss="categorical_crossentropy", optimizer="adam", metrics=["accuracy"])
     local_model.set_weights(original_weights)
 
-    # Load sample CIFAR-10 subset
+    # Load CIFAR-10 and select non-IID subset
     (x_train, y_train), _ = keras.datasets.cifar10.load_data()
-    x_local = x_train[:500].astype("float32") / 255.0
-    y_local = keras.utils.to_categorical(y_train[:500], 10)
+    allowed_classes = client_class_map[client_id]
+    idx = np.isin(y_train, allowed_classes).flatten()
+    x_local = x_train[idx].astype("float32") / 255.0
+    y_local = y_train[idx]
+    
+    # Limit samples per client for heterogeneity
+    sample_count = client_sample_count[client_id]
+    x_local = x_local[:sample_count]
+    y_local = y_local[:sample_count]
+    y_local = keras.utils.to_categorical(y_local, 10)
 
     # 4. Train locally
-    print(f"{client_id}: Training for {epochs} epochs...")
+    print(f"{client_id}: Training for {epochs} epochs on {len(x_local)} samples...")
     history = local_model.fit(x_local, y_local, epochs=epochs, batch_size=32, verbose=0)
     final_loss = history.history['loss'][-1]
     print(f"{client_id}: Training complete. Final loss: {final_loss:.4f}")
