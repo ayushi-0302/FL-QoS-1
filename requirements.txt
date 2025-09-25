@@ -8,8 +8,6 @@ click==8.2.1
 dnspython==2.7.0
 email_validator==2.2.0
 fastapi==0.116.1
-fastapi-cli==0.0.8
-fastapi-cloud-cli==0.1.5
 flatbuffers==25.2.10
 gast==0.6.0
 google-pasta==0.2.0
@@ -29,7 +27,6 @@ markdown-it-py==4.0.0
 MarkupSafe==3.0.2
 mdurl==0.1.2
 ml_dtypes==0.5.3
-namex==0.1.0
 numpy==2.3.2
 opt_einsum==3.4.0
 optree==0.17.0
@@ -65,7 +62,6 @@ typing_extensions==4.14.1
 ujson==5.10.0
 urllib3==2.5.0
 uvicorn==0.35.0
-uvloop==0.21.0
 watchfiles==1.1.0
 websockets==15.0.1
 Werkzeug==3.1.3
