@@ -184,6 +184,14 @@ def submit_update(update: ModelUpdate):
 
     return {"status": "update recorded"}
 
+@app.get("/get-status")
+def get_status():
+    """Returns current round updates and selected clients"""
+    return {
+        "clients": client_database,
+        "round_updates": round_updates
+    }
+
 # --- 7. Main Execution ---
 if __name__ == "__main__":
     uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)
