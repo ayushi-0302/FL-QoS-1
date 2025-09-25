@@ -67,7 +67,7 @@ def select_and_assign_tasks(num_clients_to_select: int, alpha: float = 0.6) -> D
     """
     FL-QoS client selection considering both system heterogeneity (QoS score)
     and statistical heterogeneity (training loss as proxy).
-    
+
     alpha: weight for system heterogeneity; (1-alpha) weight for statistical heterogeneity.
     """
     if len(client_database) < num_clients_to_select:
@@ -75,10 +75,10 @@ def select_and_assign_tasks(num_clients_to_select: int, alpha: float = 0.6) -> D
 
     available_clients = list(client_database.items())
 
-    # --- Step 1: Compute statistical scores from training loss ---
-    stat_scores = [1/(data['training_loss'] + 0.01) for _, data in available_clients]  # inverse loss
+    # --- Step 1: Compute normalized statistical scores from training loss ---
+    stat_scores = [1 / (data['training_loss'] + 0.01) for _, data in available_clients]  # inverse loss
     min_s, max_s = min(stat_scores), max(stat_scores)
-    stat_scores_norm = [(s - min_s)/(max_s - min_s + 1e-8) for s in stat_scores]  # normalize to 0-1
+    stat_scores_norm = [(s - min_s) / (max_s - min_s + 1e-8) for s in stat_scores]  # normalize to 0-1
 
     # --- Step 2: Compute combined score ---
     combined_scores = {}
@@ -91,7 +91,7 @@ def select_and_assign_tasks(num_clients_to_select: int, alpha: float = 0.6) -> D
     selected_client_ids = [client_id for client_id, _ in sorted_clients[:num_clients_to_select]]
     print(f"Selected clients based on combined system+statistical utility: {selected_client_ids}")
 
-    # --- Step 4: Dynamic Task Allocation (based on QoS only for now) ---
+    # --- Step 4: Dynamic Task Allocation (currently based on QoS) ---
     tasks = {}
     for client_id in selected_client_ids:
         qos_score = client_database[client_id]['qos_score']
@@ -113,14 +113,12 @@ def select_and_assign_tasks(num_clients_to_select: int, alpha: float = 0.6) -> D
 
     return tasks
 
-
-# --- 6. Define the API Endpoints ---
+# --- 6. API Endpoints ---
 @app.post("/register")
 def register_client(status: ClientStatus):
-    # Now, we also initialize the training_loss for new clients
     client_database[status.client_id] = { 
         "qos_score": status.qos_score,
-        "training_loss": 10.0 # Start with a high default loss
+        "training_loss": 10.0  # Start with a high default loss
     }
     return {"message": "Client registered."}
 
@@ -131,25 +129,24 @@ def start_training_round(num_clients: int):
         return {"error": "Not enough clients available."}
     return {"message": "Round started.", "tasks": tasks}
 
-# In-memory store for current round updates
-round_updates: Dict[int, List[Dict]] = {}  # key=round_id, value=list of {client_id, delta, combined_score}
+# In-memory store for round updates
+round_updates: Dict[int, List[Dict]] = {}  # round_id → list of {client_id, delta, combined_score}
 
 @app.post("/submit-update")
 def submit_update(update: ModelUpdate):
     print(f"Received update from {update.client_id} for round {update.round_id}")
 
-    # --- Step 1: Update client statistical info ---
+    # --- Step 1: Update client training loss ---
     if update.client_id in client_database:
         client_database[update.client_id]['training_loss'] = update.training_loss
 
-    # --- Step 2: Compute combined score for this client (same formula as selection) ---
+    # --- Step 2: Compute combined score for weighting ---
     alpha = 0.6
     stat_score = 1 / (update.training_loss + 0.01)
-    # normalize statistical score across all clients (simple version: assume max=1, min=0 for demo)
-    stat_score_norm = (stat_score - 0) / (1 - 0 + 1e-8)  # can improve with dynamic min/max
+    stat_score_norm = (stat_score - 0) / (1 - 0 + 1e-8)  # normalized 0-1 (simplified)
     combined_score = alpha * client_database[update.client_id]['qos_score'] + (1 - alpha) * stat_score_norm
 
-    # --- Step 3: Store the update in round_updates ---
+    # --- Step 3: Store update ---
     if update.round_id not in round_updates:
         round_updates[update.round_id] = []
     round_updates[update.round_id].append({
@@ -158,11 +155,11 @@ def submit_update(update: ModelUpdate):
         "combined_score": combined_score
     })
 
-    # --- Step 4: Aggregate updates if all selected clients submitted (or could use timeout) ---
+    # --- Step 4: Weighted aggregation if all clients submitted ---
     updates_list = round_updates[update.round_id]
     selected_clients_count = len(updates_list)
+    # Note: simple check; can be improved with actual selected clients per round
     if selected_clients_count == len([cid for cid in client_database if cid in [u['client_id'] for u in updates_list]]):
-        # Weighted aggregation
         total_score = sum(u['combined_score'] for u in updates_list)
         new_weights = [np.zeros_like(w) for w in global_model.get_weights()]
 
@@ -177,12 +174,10 @@ def submit_update(update: ModelUpdate):
         global_model.set_weights(updated_weights)
         print(f"Global model updated with weighted aggregation for round {update.round_id}")
 
-        # Clear updates for this round
+        # Clear round updates
         round_updates[update.round_id] = []
 
     return {"status": "update recorded"}
-
-
 
 # --- 7. Main Execution ---
 if __name__ == "__main__":
