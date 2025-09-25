@@ -131,26 +131,57 @@ def start_training_round(num_clients: int):
         return {"error": "Not enough clients available."}
     return {"message": "Round started.", "tasks": tasks}
 
+# In-memory store for current round updates
+round_updates: Dict[int, List[Dict]] = {}  # key=round_id, value=list of {client_id, delta, combined_score}
+
 @app.post("/submit-update")
 def submit_update(update: ModelUpdate):
     print(f"Received update from {update.client_id} for round {update.round_id}")
-    
-    # Update the client's statistical utility (its loss) in our database
+
+    # --- Step 1: Update client statistical info ---
     if update.client_id in client_database:
         client_database[update.client_id]['training_loss'] = update.training_loss
 
-    delta_weights = json_to_weights(update.weight_delta)
-    current_weights = global_model.get_weights()
-    
-    # This is a simplified aggregation for one client.
-    # In a real multi-client round, you would average all received deltas.
-    new_weights = []
-    for i in range(len(current_weights)):
-        new_weights.append(current_weights[i] + delta_weights[i])
-    global_model.set_weights(new_weights)
-    
-    print(f"Global model updated by {update.client_id}. New loss for client: {update.training_loss:.4f}")
-    return {"status": "update aggregated"}
+    # --- Step 2: Compute combined score for this client (same formula as selection) ---
+    alpha = 0.6
+    stat_score = 1 / (update.training_loss + 0.01)
+    # normalize statistical score across all clients (simple version: assume max=1, min=0 for demo)
+    stat_score_norm = (stat_score - 0) / (1 - 0 + 1e-8)  # can improve with dynamic min/max
+    combined_score = alpha * client_database[update.client_id]['qos_score'] + (1 - alpha) * stat_score_norm
+
+    # --- Step 3: Store the update in round_updates ---
+    if update.round_id not in round_updates:
+        round_updates[update.round_id] = []
+    round_updates[update.round_id].append({
+        "client_id": update.client_id,
+        "delta": json_to_weights(update.weight_delta),
+        "combined_score": combined_score
+    })
+
+    # --- Step 4: Aggregate updates if all selected clients submitted (or could use timeout) ---
+    updates_list = round_updates[update.round_id]
+    selected_clients_count = len(updates_list)
+    if selected_clients_count == len([cid for cid in client_database if cid in [u['client_id'] for u in updates_list]]):
+        # Weighted aggregation
+        total_score = sum(u['combined_score'] for u in updates_list)
+        new_weights = [np.zeros_like(w) for w in global_model.get_weights()]
+
+        for u in updates_list:
+            weight_factor = u['combined_score'] / total_score
+            for i, delta in enumerate(u['delta']):
+                new_weights[i] += delta * weight_factor
+
+        # Update global model
+        current_weights = global_model.get_weights()
+        updated_weights = [cw + nw for cw, nw in zip(current_weights, new_weights)]
+        global_model.set_weights(updated_weights)
+        print(f"Global model updated with weighted aggregation for round {update.round_id}")
+
+        # Clear updates for this round
+        round_updates[update.round_id] = []
+
+    return {"status": "update recorded"}
+
 
 
 # --- 7. Main Execution ---
