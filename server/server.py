@@ -62,23 +62,22 @@ global_model = create_cifar10_cnn_model()
 print("Initialized the global CIFAR-10 CNN model.")
 
 # --- 5. UPGRADED QOS SELECTION AND TASK ALLOCATION LOGIC ---
-
 def select_and_assign_tasks(num_clients_to_select: int, alpha: float = 0.6) -> Dict:
     """
     FL-QoS client selection considering both system heterogeneity (QoS score)
     and statistical heterogeneity (training loss as proxy).
 
-    alpha: weight for system heterogeneity; (1-alpha) weight for statistical heterogeneity.
+    Task allocation (epochs) also depends on combined score.
     """
     if len(client_database) < num_clients_to_select:
         return {}
 
     available_clients = list(client_database.items())
 
-    # --- Step 1: Compute normalized statistical scores from training loss ---
-    stat_scores = [1 / (data['training_loss'] + 0.01) for _, data in available_clients]  # inverse loss
+    # --- Step 1: Compute normalized statistical scores ---
+    stat_scores = [1 / (data['training_loss'] + 0.01) for _, data in available_clients]
     min_s, max_s = min(stat_scores), max(stat_scores)
-    stat_scores_norm = [(s - min_s) / (max_s - min_s + 1e-8) for s in stat_scores]  # normalize to 0-1
+    stat_scores_norm = [(s - min_s) / (max_s - min_s + 1e-8) for s in stat_scores]  # normalize 0-1
 
     # --- Step 2: Compute combined score ---
     combined_scores = {}
@@ -86,32 +85,38 @@ def select_and_assign_tasks(num_clients_to_select: int, alpha: float = 0.6) -> D
         combined_score = alpha * data['qos_score'] + (1 - alpha) * stat_scores_norm[i]
         combined_scores[client_id] = combined_score
 
-    # --- Step 3: Select top N clients based on combined score ---
+    # --- Step 3: Select top N clients ---
     sorted_clients = sorted(combined_scores.items(), key=lambda item: item[1], reverse=True)
     selected_client_ids = [client_id for client_id, _ in sorted_clients[:num_clients_to_select]]
     print(f"Selected clients based on combined system+statistical utility: {selected_client_ids}")
 
-    # --- Step 4: Dynamic Task Allocation (currently based on QoS) ---
+    # --- Step 4: Dynamic Task Allocation (based on combined score) ---
     tasks = {}
-    for client_id in selected_client_ids:
-        qos_score = client_database[client_id]['qos_score']
+    max_epochs = 10
+    min_epochs = 2
 
-        # Dynamic allocation: higher QoS → more epochs
-        if qos_score > 0.8:
-            epochs = 10
-        elif qos_score > 0.5:
-            epochs = 5
+    # Find min/max combined score among selected clients for scaling epochs
+    selected_scores = [combined_scores[cid] for cid in selected_client_ids]
+    min_score, max_score = min(selected_scores), max(selected_scores)
+
+    for client_id in selected_client_ids:
+        # Scale epochs linearly between min_epochs and max_epochs based on combined score
+        score = combined_scores[client_id]
+        if max_score - min_score < 1e-8:  # avoid division by zero
+            epochs = max_epochs
         else:
-            epochs = 2
+            epochs = min_epochs + (score - min_score) / (max_score - min_score) * (max_epochs - min_epochs)
+            epochs = int(round(epochs))
 
         tasks[client_id] = {
             "round_id": 1,  # TODO: implement proper round counter
             "model_weights": weights_to_json(global_model.get_weights()),
             "epochs": epochs
         }
-        print(f"  > Assigned task to {client_id}: {epochs} epochs")
+        print(f"  > Assigned task to {client_id}: {epochs} epochs (combined score: {combined_scores[client_id]:.3f})")
 
     return tasks
+
 
 # --- 6. API Endpoints ---
 @app.post("/register")
