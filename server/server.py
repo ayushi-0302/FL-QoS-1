@@ -1,197 +1,254 @@
-# server.py
+# --- Global Configuration ---
+MIN_SUBMISSION_RATIO = 0.6
+MAX_QOS_EPOCHS = 10
+MIN_QOS_EPOCHS = 2
 
-# --- Import necessary libraries ---
-import uvicorn
+# --- FastAPI Setup ---
 from fastapi import FastAPI
 from pydantic import BaseModel
-from typing import List, Dict
-import tensorflow as tf
-from tensorflow import keras
-from tensorflow.keras import layers
+import uvicorn
 import numpy as np
-import random # We need this for random selection during exploration
+from typing import List, Dict
 
-# --- 1. Initialize the FastAPI application ---
-app = FastAPI(
-    title="FL-QoS Server",
-    description="Manages clients and orchestrates federated learning rounds."
-)
+# Import TensorFlow/Keras for model definition on the server
+import tensorflow as tf
+from tensorflow import keras 
 
-# --- 2. In-Memory Storage ---
-client_database: Dict[str, Dict] = {}
-global_model = None
+app = FastAPI()
 
-# --- 3. Define the structure of the data our API expects ---
+# --- In-Memory State ---
+global_round_id = 0
+client_database = {}
+current_round_clients = set()
+round_updates = {}
+
+# --- Data Models ---
 class ClientStatus(BaseModel):
     client_id: str
     qos_score: float
+    data_utility: float  # e.g., entropy, diversity, etc.
 
 class ModelUpdate(BaseModel):
     client_id: str
     round_id: int
     weight_delta: List[list]
-    # NEW: The client reports its training loss from the last round
-    training_loss: float
+    initial_loss: float
+    final_loss: float
+    sample_count: int
 
-# --- 4. Create the real global AI model ---
-def create_cifar10_cnn_model():
-    """Creates a CNN model for CIFAR-10."""
-    model = keras.Sequential(
-        [
-            keras.Input(shape=(32, 32, 3)),
-            layers.Conv2D(32, kernel_size=(3, 3), activation="relu"),
-            layers.MaxPooling2D(pool_size=(2, 2)),
-            layers.Conv2D(64, kernel_size=(3, 3), activation="relu"),
-            layers.MaxPooling2D(pool_size=(2, 2)),
-            layers.Flatten(),
-            layers.Dropout(0.5),
-            layers.Dense(10, activation="softmax"),
-        ]
-    )
-    return model
-
+# --- Helper Functions ---
 def weights_to_json(weights: List[np.ndarray]) -> List[List[float]]:
-    """Serializes NumPy arrays to JSON lists."""
     return [w.tolist() for w in weights]
 
 def json_to_weights(json_weights: List[List[float]]) -> List[np.ndarray]:
-    """Deserializes JSON lists back to NumPy arrays."""
     return [np.array(w) for w in json_weights]
 
-global_model = create_cifar10_cnn_model()
-print("Initialized the global CIFAR-10 CNN model.")
+def calculate_statistical_utility(initial_loss: float, final_loss: float) -> float:
+    return max(0.0, initial_loss - final_loss)
 
-# --- 5. UPGRADED QOS SELECTION AND TASK ALLOCATION LOGIC ---
-def select_and_assign_tasks(num_clients_to_select: int, alpha: float = 0.6) -> Dict:
-    """
-    FL-QoS client selection considering both system heterogeneity (QoS score)
-    and statistical heterogeneity (training loss as proxy).
 
-    Task allocation (epochs) also depends on combined score.
-    """
-    if len(client_database) < num_clients_to_select:
-        return {}
+
+# --- Global Model (UPDATED) ---
+def create_cifar10_cnn_model():
+    """Creates the actual Keras model used by the clients."""
+    model = tf.keras.models.Sequential([
+        tf.keras.layers.Input(shape=(32, 32, 3)),
+        tf.keras.layers.Conv2D(32, (3, 3), activation="relu"),
+        tf.keras.layers.MaxPooling2D((2, 2)),
+        tf.keras.layers.Conv2D(64, (3, 3), activation="relu"),
+        tf.keras.layers.MaxPooling2D((2, 2)),
+        tf.keras.layers.Flatten(),
+        tf.keras.layers.Dropout(0.5),
+        tf.keras.layers.Dense(10, activation="softmax"),
+    ])
+    model.compile(loss="categorical_crossentropy", optimizer="adam", metrics=["accuracy"])
+    return model
+
+class KerasModelWrapper:
+    """A simple wrapper to match the get_weights/set_weights interface."""
+    def __init__(self, model):
+        self.model = model
+    def get_weights(self): 
+        return self.model.get_weights()
+    def set_weights(self, weights): 
+        self.model.set_weights(weights)
+
+global_model = KerasModelWrapper(create_cifar10_cnn_model())
+
+# --- Pareto Frontier Selection ---
+def pareto_select(clients: List[tuple]) -> List[str]:
+    selected = []
+    for cid1, data1 in clients:
+        dominated = False
+        for cid2, data2 in clients:
+            if cid1 == cid2: continue
+            if (data2['qos_score'] >= data1['qos_score'] and
+                data2['data_utility'] >= data1['data_utility'] and
+                (data2['qos_score'] > data1['qos_score'] or data2['data_utility'] > data1['data_utility'])):
+                dominated = True
+                break
+        if not dominated:
+            selected.append(cid1)
+    return selected
+
+# --- Tiered Sampling ---
+def assign_tiers(clients: List[str]) -> Dict[str, str]:
+    tiers = {}
+    for cid in clients:
+        qos = client_database[cid]['qos_score']
+        data = client_database[cid]['data_utility']
+        if qos > 0.7 and data > 0.7:
+            tiers[cid] = "Tier 1"
+        elif data > 0.7:
+            tiers[cid] = "Tier 2"
+        elif qos > 0.7:
+            tiers[cid] = "Tier 3"
+        else:
+            tiers[cid] = "Tier 4"
+    return tiers
+
+# --- Task Assignment ---
+def select_and_assign_tasks(num_clients_to_select: int) -> Dict:
+    # Ensure this is the first line to be absolutely safe
+    global global_round_id 
+    current_rid = global_round_id
 
     available_clients = list(client_database.items())
+    if len(available_clients) < num_clients_to_select:
+        return {}
 
-    # --- Step 1: Compute normalized statistical scores ---
-    stat_scores = [1 / (data['training_loss'] + 0.01) for _, data in available_clients]
-    min_s, max_s = min(stat_scores), max(stat_scores)
-    stat_scores_norm = [(s - min_s) / (max_s - min_s + 1e-8) for s in stat_scores]  # normalize 0-1
+    # Normalize scores
+    qos_vals = [data['qos_score'] for _, data in available_clients]
+    data_vals = [data['data_utility'] for _, data in available_clients]
+    min_q, max_q = min(qos_vals), max(qos_vals)
+    min_d, max_d = min(data_vals), max(data_vals)
 
-    # --- Step 2: Compute combined score ---
-    combined_scores = {}
-    for i, (client_id, data) in enumerate(available_clients):
-        combined_score = alpha * data['qos_score'] + (1 - alpha) * stat_scores_norm[i]
-        combined_scores[client_id] = combined_score
+    for cid, data in client_database.items():
+        data['qos_norm'] = (data['qos_score'] - min_q) / (max_q - min_q + 1e-8)
+        data['data_norm'] = (data['data_utility'] - min_d) / (max_d - min_d + 1e-8)
 
-    # --- Step 3: Select top N clients ---
-    sorted_clients = sorted(combined_scores.items(), key=lambda item: item[1], reverse=True)
-    selected_client_ids = [client_id for client_id, _ in sorted_clients[:num_clients_to_select]]
-    print(f"Selected clients based on combined system+statistical utility: {selected_client_ids}")
+    # Pareto selection
+    pareto_clients = pareto_select(available_clients)
+    tiers = assign_tiers(pareto_clients)
 
-    # --- Step 4: Dynamic Task Allocation (based on combined score) ---
+    # Tiered sampling
+    selected = []
+    for cid in pareto_clients:
+        tier = tiers[cid]
+        if tier == "Tier 1":
+            selected.append(cid)
+        elif tier == "Tier 2":
+            if np.random.rand() < 0.5:  # lower frequency
+                selected.append(cid)
+        elif tier == "Tier 3":
+            if len(selected) < num_clients_to_select:
+                selected.append(cid)
+
+    selected = selected[:num_clients_to_select]
+    current_round_clients.update(selected)
+
+    # Assign tasks
     tasks = {}
-    max_epochs = 10
-    min_epochs = 2
-
-    # Find min/max combined score among selected clients for scaling epochs
-    selected_scores = [combined_scores[cid] for cid in selected_client_ids]
-    min_score, max_score = min(selected_scores), max(selected_scores)
-
-    for client_id in selected_client_ids:
-        # Scale epochs linearly between min_epochs and max_epochs based on combined score
-        score = combined_scores[client_id]
-        if max_score - min_score < 1e-8:  # avoid division by zero
-            epochs = max_epochs
-        else:
-            epochs = min_epochs + (score - min_score) / (max_score - min_score) * (max_epochs - min_epochs)
-            epochs = int(round(epochs))
-
-        tasks[client_id] = {
-            "round_id": 1,  # TODO: implement proper round counter
+    for cid in selected:
+        qos_norm = client_database[cid]['qos_norm']
+        epochs = MIN_QOS_EPOCHS + qos_norm * (MAX_QOS_EPOCHS - MIN_QOS_EPOCHS)
+        epochs = max(MIN_QOS_EPOCHS, int(round(epochs)))
+        tasks[cid] = {
+            "round_id": current_rid,
             "model_weights": weights_to_json(global_model.get_weights()),
             "epochs": epochs
         }
-        print(f"  > Assigned task to {client_id}: {epochs} epochs (combined score: {combined_scores[client_id]:.3f})")
 
     return tasks
 
+# --- Aggregation ---
+def fl_qos_aggregate():
+    # Ensure this is the first line to be absolutely safe
+    global global_round_id
+    current_rid = global_round_id
+    updates_list = round_updates.get(current_rid, [])
+    if not updates_list: return False
 
-# --- 6. API Endpoints ---
+    total_score = sum(u['combined_score'] for u in updates_list)
+    
+    # Initialize new_weights array based on the current model's structure
+    new_weights = [np.zeros_like(w) for w in global_model.get_weights()]
+
+    for u in updates_list:
+        weight_factor = u['combined_score'] / (total_score + 1e-8)
+        for i, delta in enumerate(u['delta']):
+            new_weights[i] += delta * weight_factor
+
+    updated_weights = [cw + nw for cw, nw in zip(global_model.get_weights(), new_weights)]
+    global_model.set_weights(updated_weights)
+
+    round_updates[current_rid] = []
+    current_round_clients.clear()
+    
+    # Global keyword used before modification
+    global_round_id += 1 
+    return True
+
+# --- API Endpoints ---
 @app.post("/register")
 def register_client(status: ClientStatus):
-    client_database[status.client_id] = { 
+    client_database[status.client_id] = {
         "qos_score": status.qos_score,
-        "training_loss": 10.0  # Start with a high default loss
+        "data_utility": status.data_utility,
+        "training_loss": 10.0
     }
     return {"message": "Client registered."}
 
 @app.post("/start-training-round")
 def start_training_round(num_clients: int):
+    # This function now only READS the results of select_and_assign_tasks.
+    # It does NOT modify global_round_id, so the 'global' keyword is not required 
+    # and its omission avoids the tricky parser error.
+    
     tasks = select_and_assign_tasks(num_clients)
     if not tasks:
-        return {"error": "Not enough clients available."}
+        # If selection fails, the round ID is NOT decremented (no rollback).
+        # It remains at the current value, waiting for the next attempt.
+        return {"error": "Not enough clients available or zero clients selected in current round."}
     return {"message": "Round started.", "tasks": tasks}
-
-# In-memory store for round updates
-round_updates: Dict[int, List[Dict]] = {}  # round_id → list of {client_id, delta, combined_score}
 
 @app.post("/submit-update")
 def submit_update(update: ModelUpdate):
-    print(f"Received update from {update.client_id} for round {update.round_id}")
+    if update.round_id != global_round_id:
+        return {"status": "Update discarded (round expired)."}
 
-    # --- Step 1: Update client training loss ---
-    if update.client_id in client_database:
-        client_database[update.client_id]['training_loss'] = update.training_loss
+    stat_utility = calculate_statistical_utility(update.initial_loss, update.final_loss)
+    stat_utility_norm = min(1.0, stat_utility)
+    qos_score = client_database[update.client_id]['qos_score']
+    combined_score = 0.5 * qos_score + 0.5 * stat_utility_norm
 
-    # --- Step 2: Compute combined score for weighting ---
-    alpha = 0.6
-    stat_score = 1 / (update.training_loss + 0.01)
-    stat_score_norm = (stat_score - 0) / (1 - 0 + 1e-8)  # normalized 0-1 (simplified)
-    combined_score = alpha * client_database[update.client_id]['qos_score'] + (1 - alpha) * stat_score_norm
+    client_database[update.client_id]['training_loss'] = update.final_loss
+    current_rid = update.round_id
+    if current_rid not in round_updates:
+        round_updates[current_rid] = []
 
-    # --- Step 3: Store update ---
-    if update.round_id not in round_updates:
-        round_updates[update.round_id] = []
-    round_updates[update.round_id].append({
+    round_updates[current_rid].append({
         "client_id": update.client_id,
         "delta": json_to_weights(update.weight_delta),
-        "combined_score": combined_score
+        "combined_score": combined_score,
+        "n_samples": update.sample_count
     })
 
-    # --- Step 4: Weighted aggregation if all clients submitted ---
-    updates_list = round_updates[update.round_id]
-    selected_clients_count = len(updates_list)
-    # Note: simple check; can be improved with actual selected clients per round
-    if selected_clients_count == len([cid for cid in client_database if cid in [u['client_id'] for u in updates_list]]):
-        total_score = sum(u['combined_score'] for u in updates_list)
-        new_weights = [np.zeros_like(w) for w in global_model.get_weights()]
+    submitted_count = len(round_updates[current_rid])
+    if len(current_round_clients) > 0 and submitted_count >= len(current_round_clients) * MIN_SUBMISSION_RATIO:
+        fl_qos_aggregate()
 
-        for u in updates_list:
-            weight_factor = u['combined_score'] / total_score
-            for i, delta in enumerate(u['delta']):
-                new_weights[i] += delta * weight_factor
-
-        # Update global model
-        current_weights = global_model.get_weights()
-        updated_weights = [cw + nw for cw, nw in zip(current_weights, new_weights)]
-        global_model.set_weights(updated_weights)
-        print(f"Global model updated with weighted aggregation for round {update.round_id}")
-
-        # Clear round updates
-        round_updates[update.round_id] = []
-
-    return {"status": "update recorded"}
+    return {"status": "Update recorded."}
 
 @app.get("/get-status")
 def get_status():
-    """Returns current round updates and selected clients"""
     return {
+        "global_round_id": global_round_id,
         "clients": client_database,
-        "round_updates": round_updates
+        "current_round_clients": list(current_round_clients),
+        "updates_in_round": len(round_updates.get(global_round_id, []))
     }
 
-# --- 7. Main Execution ---
+# --- Main Execution ---
 if __name__ == "__main__":
     uvicorn.run("server:app", host="0.0.0.0", port=8000, reload=True)
