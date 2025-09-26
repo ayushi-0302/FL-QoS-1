@@ -1,92 +1,83 @@
-import matplotlib.pyplot as plt
-from matplotlib.animation import FuncAnimation
 import requests
 
-SERVER_URL = "http://localhost:8000"
-
-fig, ax = plt.subplots(figsize=(10, 6))
-
-# Store previous combined scores for smooth transitions
-previous_scores = {}
-training_done = False  # flag to freeze once finished
-
-def fetch_status():
-    """Fetch the current status from the server."""
+def fetch_live_status():
     try:
-        response = requests.get(f"{SERVER_URL}/get-status")
-        data = response.json()
-        return data
-    except:
-        return {"clients": {}, "round_updates": {}, "finished": False}
+        response = requests.get("http://127.0.0.1:8000/get-status")
+        if response.status_code == 200:
+            return response.json()
+        else:
+            return None
+    except Exception as e:
+        print(f"Error fetching status: {e}")
+        return None
 
-def update(frame):
-    global previous_scores, training_done
-
-    status = fetch_status()
-    clients = status["clients"]
-    client_ids = list(clients.keys())
-
-    if status.get("finished", False):
-        training_done = True
-
-    if not client_ids:
-        ax.clear()
-        ax.set_title("Waiting for client updates...")
+def animate_pareto_plot(i, ax):
+    """Update function for Matplotlib's animation, plotting QoS vs. Data Utility with clear selection coloring."""
+    
+    status = fetch_live_status()
+    if status is None:
+        ax.set_title("FL-QoS Demo: Waiting for Server...", color='gray')
         return
 
-    qos_scores = [clients[c]["qos_score"] for c in client_ids]
-    stat_scores_raw = [1 / (clients[c].get("training_loss", 10.0) + 0.01) for c in client_ids]
-    max_stat_score = max(stat_scores_raw) if stat_scores_raw else 1.0
-    stat_scores = [s / max_stat_score for s in stat_scores_raw]
-
-    combined_scores = [0.6*q + 0.4*s for q, s in zip(qos_scores, stat_scores)]
-
-    # Freeze scores if training is done
-    if training_done:
-        smooth_scores = combined_scores
-    else:
-        smooth_scores = []
-        for cid, score in zip(client_ids, combined_scores):
-            prev = previous_scores.get(cid, 0)
-            smooth = prev + 0.15 * (score - prev)  # gradual transition
-            smooth_scores.append(smooth)
-            previous_scores[cid] = smooth
-
-    # Sort by combined score (highest first)
-    sorted_clients = sorted(zip(client_ids, qos_scores, stat_scores, smooth_scores),
-                            key=lambda x: x[3], reverse=True)
-    client_ids, qos_scores, stat_scores, smooth_scores = zip(*sorted_clients)
-
+    client_data = status['clients']
+    current_round = status['global_round_id']
+    selected_clients = status['current_round_clients']
+    
     ax.clear()
 
-    # QoS contribution bars
-    bottoms = [0]*len(client_ids)
-    ax.bar(client_ids, [0.6*q for q in qos_scores], bottom=bottoms,
-           color="#1f77b4", alpha=0.7, label="QoS Contribution")
+    if not client_data:
+        ax.set_title("FL-QoS Demo: Awaiting Client Registration...", color='blue')
+        return
 
-    # Stat contribution bars
-    bottoms = [0.6*q for q in qos_scores]
-    ax.bar(client_ids, [0.4*s for s in stat_scores], bottom=bottoms,
-           color="#ff7f0e", alpha=0.7, label="Stat Contribution")
+    # Prepare Data
+    client_ids = list(client_data.keys())
+    qos_scores = [data.get('qos_score', 0.0) for data in client_data.values()]
+    data_utilities = [data.get('data_utility', 0.0) for data in client_data.values()]
 
-    # Overlay combined score line
-    ax.plot(client_ids, smooth_scores, marker="o", color="black",
-            linewidth=2, label="Combined Score")
+    # Colors for selection status
+    colors = ['gold' if cid in selected_clients else 'dodgerblue' for cid in client_ids]
+    alphas = [1.0 if cid in selected_clients else 0.6 for cid in client_ids]
 
-    # Score labels
-    for i, cid in enumerate(client_ids):
-        ax.text(i, smooth_scores[i] + 0.02, f"{smooth_scores[i]:.2f}",
-                ha='center', va='bottom', fontsize=9, color="black")
+    # Scatter plot
+    ax.scatter(data_utilities, qos_scores, 
+               c=colors, alpha=alphas, edgecolor='black', linewidth=1.2)
 
-    ax.set_ylim(0, 1.1)
-    ax.set_ylabel("Combined Score")
-    title = "FL-QoS: Real-Time Client Contribution"
-    if training_done:
-        title += " (Finalized)"
-    ax.set_title(title, fontsize=14, fontweight="bold")
-    ax.legend(loc="upper left", frameon=False)
-    ax.grid(axis="y", linestyle="--", alpha=0.4)
+    # Title & labels
+    ax.set_title(f"FL-QoS: Client Selection (Round {current_round})", 
+                 fontsize=14, fontweight='bold')
+    ax.set_xlabel("Data Utility (Entropy/Diversity)", fontsize=12)
+    ax.set_ylabel("QoS Score (System Reliability)", fontsize=12)
+    
+    ax.set_xlim(-0.05, 1.05)
+    ax.set_ylim(-0.05, 1.05)
+    ax.grid(True, linestyle='--', alpha=0.5)
 
-ani = FuncAnimation(fig, update, interval=1000)
-plt.tight_layout()
-plt.show()
+    # Annotate with client IDs only
+    for x, y, cid in zip(data_utilities, qos_scores, client_ids):
+        ax.annotate(cid, (x, y), textcoords="offset points", xytext=(5, 5), 
+                    ha='left', fontsize=9, fontweight='bold')
+
+    # Legend
+    handle_selected = plt.Line2D([0], [0], marker='o', color='w', label='Selected Client', 
+                                 markersize=10, markerfacecolor='gold', markeredgecolor='black', linestyle='')
+    handle_unselected = plt.Line2D([0], [0], marker='o', color='w', label='Unselected Client', 
+                                   markersize=10, markerfacecolor='dodgerblue', markeredgecolor='black', linestyle='')
+    
+    ax.legend(handles=[handle_selected, handle_unselected], 
+              title="Selection Status",
+              loc='upper left', bbox_to_anchor=(1.05, 1.05), fancybox=True, shadow=True)
+
+if __name__ == "__main__":
+    import matplotlib.pyplot as plt
+    import matplotlib.animation as animation
+
+    fig, ax = plt.subplots(figsize=(10, 8))
+    fig.subplots_adjust(right=0.75)  # leave space for legend
+
+    ani = animation.FuncAnimation(fig, animate_pareto_plot, fargs=(ax,), interval=3000)
+
+    print("\n--- Starting FL-QoS Pareto Frontier Visualization ---")
+    print("X-axis: Data Utility (StatHet). Y-axis: QoS (SysHet).")
+    print("Keep the server and clients running. Plot will update every 3 seconds.")
+
+    plt.show()
